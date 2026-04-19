@@ -39,6 +39,12 @@ def is_private_ip(ip_str: str) -> bool:
     except ValueError:
         return False
 
+def is_ipv6(ip_str: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip_str).version == 6
+    except ValueError:
+        return False
+
 # 全局 DNS 缓存 与 全局复用 Session、限流器 (防止 Serverless OOM 及 FD 耗尽)
 DNS_CACHE = {}
 DNS_CACHE_TTL = 300  # 缓存 5 分钟
@@ -95,8 +101,8 @@ def is_blocked_domain(host: str) -> bool:
 async def req_doh(host: str, url: str) -> str:
     global GLOBAL_DOH_SESSION
     if GLOBAL_DOH_SESSION is None or GLOBAL_DOH_SESSION.closed:
-        # 建立具备连接池复用能力的 Session
-        conn = aiohttp.TCPConnector(limit=10, limit_per_host=5)
+        # 建立具备连接池复用能力的 Session，大幅提升并发上限，消除排队延迟
+        conn = aiohttp.TCPConnector(limit=100, limit_per_host=50)
         GLOBAL_DOH_SESSION = aiohttp.ClientSession(connector=conn)
         
     try:
@@ -190,8 +196,9 @@ class ProxyHandler:
     async def _forward_data(self, websocket, resolved_host, port, early_data=b''):
         """核心双向数据透传模块，已全面执行底层的反 NAT 优化"""
         try:
+            # 强制注入 family=socket.AF_INET，从内核层彻底阻断操作系统尝试 IPv6 连接，根除 10 秒死等
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(resolved_host, port), timeout=10.0
+                asyncio.open_connection(resolved_host, port, family=socket.AF_INET), timeout=10.0
             )
             
             # --- [ TCP 底层双重优化开始 ] ---
@@ -410,6 +417,13 @@ class ProxyHandler:
                     logger.warning(f"Blocked private IP access: {resolved_host}")
                 await websocket.close()
                 return False
+                
+            # IPv6 快速熔断：Render 等 PaaS 通常不支持 IPv6 出站，直接拒绝以逼迫客户端瞬间 Fallback 到 IPv4，消除 10 秒死等卡顿
+            if is_ipv6(resolved_host):
+                if DEBUG:
+                    logger.debug(f"IPv6 Fast Reject: {resolved_host}")
+                await websocket.close()
+                return False
             
             await self._forward_data(websocket, resolved_host, port, first_msg[i:])
             return True
@@ -498,6 +512,13 @@ async def make_app():
     return app
 
 async def main():
+    # 扩容 asyncio 默认线程池，防止 getaddrinfo 阻塞导致雪崩卡顿
+    # 将 max_workers 设为 40，在 512MB 内存的 PaaS 容器中取得并发与内存的最佳平衡
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(
+        __import__('concurrent.futures').futures.ThreadPoolExecutor(max_workers=40)
+    )
+
     actual_port = PORT
     
     if not is_port_available(actual_port):
